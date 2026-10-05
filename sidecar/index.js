@@ -1760,6 +1760,17 @@ const widgetStore = makeDurableJsonStore({
   onCorrupt: (key, file) => quarantineCorrupt(file, 'widgets')
 });
 const widgetTools = makeWidgetTools({ store: widgetStore, clock: { now: () => Date.now() }, redact });
+
+// EAR (Execution Approval Request) durable store — one entry per conversation waiting for human approval.
+// Backed by the same crash-safe durable-store discipline as other singletons so a sidecar restart does not
+// silently discard a pending approval. Keyed by conversationId (bounded + validated in the handlers).
+const earStore = makeDurableJsonStore({
+  fs: fs, path: path,
+  fileFor: () => path.join(WORKSPACES, 'ear-pending.json'),
+  writeDurable: writeFileDurable,
+  onRecover: (_key, file) => console.warn('[ear] recovered ' + file + ' from .bak after corrupt/torn write.'),
+  onCorrupt: (_key, file) => quarantineCorrupt(file, 'ear')
+});
 const widgetsDeleting = new Set();
 
 // AWAY WORKSHOP — per-agent durable state for "Build things while I'm away": the Commander's recorded grant,
@@ -9296,6 +9307,9 @@ const ROUTES = [
   { m: 'POST', exact: '/api/consent', h: handleConsent },
   { m: 'POST', exact: '/api/consent/ack', h: handleConsentAck },   // EL-11: the browser attests the prompt is human-visible
   { m: 'POST', exact: '/api/consent/answer', h: handleConsentAnswer },   // in-turn clarify: the Commander's live answer to a brief.ask card
+  { m: 'POST', exact: '/api/ear', h: handleEarSet },        // EAR: store a pending approval request
+  { m: 'GET',  exact: '/api/ear', h: handleEarGet },        // EAR: fetch by conversationId
+  { m: 'DELETE', exact: '/api/ear', h: handleEarClear },    // EAR: remove after approval/rejection
   { m: 'GET', exact: '/api/permissions', h: handlePermissionsList },
   { m: 'POST', exact: '/api/permissions/grant', h: handlePermissionsGrant },
   { m: 'POST', exact: '/api/permissions/revoke', h: handlePermissionsRevoke },
@@ -17985,6 +17999,41 @@ async function handleConsentAnswer(req, res) {
   if (finish && text) finish({ __clarify: true, text });
   if(body.receipt === true) return respondJson(res,200,{ok:!!(finish && text)});
   res.writeHead(200); res.end('ok');
+}
+
+// ── EAR (Execution Approval Request) HTTP API ──────────────────────────────────────────────────
+// Used by the Next.js web layer (apps/web) so EAR state lives in the sidecar's durable store
+// rather than in-process memory. Three operations keep the interface minimal and safe:
+//   POST   /api/ear        { conversationId, directive, agentId } → store (idempotent set)
+//   GET    /api/ear?id=…   → { ear } | { ear: null }
+//   DELETE /api/ear?id=…   → { ok: true }
+// conversationId is bounded to 128 chars and validated to prevent path/key injection.
+const EAR_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
+async function handleEarSet(req, res) {
+  let body;
+  try { body = JSON.parse(await readBody(req, 4096)) || {}; } catch (_) { res.writeHead(400); return res.end('bad json'); }
+  const id = String(body.conversationId || '').trim();
+  if (!EAR_ID_RE.test(id)) { res.writeHead(400); return res.end('invalid conversationId'); }
+  const directive = String(body.directive || '').trim().slice(0, 4000);
+  const agentId = String(body.agentId || 'agent').trim().slice(0, 40);
+  if (!directive) { res.writeHead(400); return res.end('missing directive'); }
+  await earStore.set(id, { conversationId: id, directive, agentId, createdAt: Date.now() });
+  respondJson(res, 200, { ok: true });
+}
+
+async function handleEarGet(req, res) {
+  const id = String((new URL(req.url, 'http://localhost').searchParams.get('id')) || '').trim();
+  if (!EAR_ID_RE.test(id)) { res.writeHead(400); return res.end('invalid id'); }
+  const ear = await earStore.get(id);
+  respondJson(res, 200, { ear: ear || null });
+}
+
+async function handleEarClear(req, res) {
+  const id = String((new URL(req.url, 'http://localhost').searchParams.get('id')) || '').trim();
+  if (!EAR_ID_RE.test(id)) { res.writeHead(400); return res.end('invalid id'); }
+  await earStore.set(id, null);   // durable-store: set to null marks absent; get() returns undefined
+  respondJson(res, 200, { ok: true });
 }
 
 // POST /api/consent/ack { runId, promptId } — EL-11 FIX 1c: the browser's attestation that this consent prompt

@@ -1,15 +1,16 @@
-/* apps/web/lib/ear-store.ts — in-memory Execution Approval Request (EAR) store.
+/* apps/web/lib/ear-store.ts — HTTP-backed EAR (Execution Approval Request) store.
 
-   One EAR per conversation: a task directive waiting for explicit human approval before the
-   lead agent is dispatched.  The map lives in process memory (single-process Next.js server);
-   a Redis/Durable-Store layer can replace it without changing the interface.
+   Delegates to the sidecar's /api/ear endpoint so EAR state is:
+     • shared across all Next.js workers / edge replicas
+     • durable across sidecar and Next.js restarts (backed by makeDurableJsonStore)
+     • isolated from this process's memory
 
-   Lifecycle:
-     set(id, ear)  — called after task-brief phase produces a confirmed directive
-     get(id)       — called by the approval handler to retrieve the pending EAR
-     clear(id)     — called immediately AFTER get(), before dispatch, so a second "Approved"
-                     message on the same conversation never double-dispatches
-     has(id)       — guard check before attempting get()
+   The sidecar exposes:
+     POST   /api/ear        { conversationId, directive, agentId } → { ok: true }
+     GET    /api/ear?id=…   → { ear: EAR | null }
+     DELETE /api/ear?id=…   → { ok: true }
+
+   All methods are async. conversationId must match /^[A-Za-z0-9_-]{1,128}$/.
 */
 
 export interface EAR {
@@ -19,23 +20,25 @@ export interface EAR {
   createdAt: number;
 }
 
-const _store = new Map<string, EAR>();
+const SIDECAR_URL = process.env.SIDECAR_URL ?? 'http://127.0.0.1:8787';
+
+async function sidecarFetch(method: string, path: string, body?: object): Promise<unknown> {
+  const init: RequestInit = { method, headers: { 'Content-Type': 'application/json' } };
+  if (body !== undefined) init.body = JSON.stringify(body);
+  const res = await fetch(`${SIDECAR_URL}${path}`, init);
+  if (!res.ok) throw new Error(`ear-store: sidecar ${method} ${path} returned ${res.status}`);
+  return res.json();
+}
 
 export const earStore = {
-  set(conversationId: string, ear: EAR): void {
-    _store.set(conversationId, ear);
+  async set(conversationId: string, ear: Omit<EAR, 'conversationId' | 'createdAt'>): Promise<void> {
+    await sidecarFetch('POST', '/api/ear', { conversationId, ...ear });
   },
-  get(conversationId: string): EAR | undefined {
-    return _store.get(conversationId);
+  async get(conversationId: string): Promise<EAR | null> {
+    const data = await sidecarFetch('GET', `/api/ear?id=${encodeURIComponent(conversationId)}`) as { ear: EAR | null };
+    return data.ear ?? null;
   },
-  clear(conversationId: string): void {
-    _store.delete(conversationId);
-  },
-  has(conversationId: string): boolean {
-    return _store.has(conversationId);
-  },
-  /** Test-only: wipe all entries so tests are isolated. */
-  _reset(): void {
-    _store.clear();
+  async clear(conversationId: string): Promise<void> {
+    await sidecarFetch('DELETE', `/api/ear?id=${encodeURIComponent(conversationId)}`);
   },
 };

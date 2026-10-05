@@ -1,17 +1,24 @@
-/* apps/web/lib/agent-dispatch.ts — bridge from the approval handler to the sidecar lead agent.
+/* apps/web/lib/agent-dispatch.ts — sidecar /api/run bridge with NDJSON→SSE translation.
 
-   dispatchLeadAgent() POSTs to the sidecar's NDJSON run stream (/api/run) and fans out
-   events to the three caller-supplied callbacks, matching the contract hub.js and cron-driver.js
-   use:  agent.token delta → onToken  |  agent.run.end → onEnd  |  agent.run.error → onError
+   Two exports:
+     dispatchLeadAgent(options)  — approval lane: run a pre-approved EAR directive
+     sidecarRunStream(messages, agentId?) — LLM lane: run arbitrary conversation messages
 
-   Sidecar wire format (NDJSON, one JSON object per line):
-     {"name":"agent.token","payload":{"delta":"<text>", ...}}\n
-     {"name":"agent.run.end","payload":{...}}\n
-     {"name":"agent.run.error","payload":{"message":"<text>", ...}}\n
-     \n   (keepalive blank lines — skipped)
+   Both translate the sidecar's NDJSON stream into the shared SSE wire format:
+     data: {"type":"token","token":"…"}\n\n
+     data: {"type":"done"}\n\n
+     data: {"type":"error","message":"…"}\n\n
+
+   Sidecar NDJSON input format (one JSON object per line):
+     {"name":"agent.token","payload":{"delta":"<text>"}}\n
+     {"name":"agent.run.end","payload":{…}}\n
+     {"name":"agent.run.error","payload":{"message":"<text>"}}\n
+     \n  (keepalive blank lines — skipped)
 */
 
 import type { EAR } from './ear-store';
+
+const SIDECAR_URL = process.env.SIDECAR_URL ?? 'http://127.0.0.1:8787';
 
 export interface DispatchCallbacks {
   onToken(token: string): void;
@@ -23,21 +30,20 @@ export interface DispatchOptions extends DispatchCallbacks {
   ear: EAR;
 }
 
-const SIDECAR_URL = process.env.SIDECAR_URL ?? 'http://127.0.0.1:8787';
-
-export async function dispatchLeadAgent(options: DispatchOptions): Promise<void> {
-  const { ear, onToken, onEnd, onError } = options;
+/** POST to /api/run and fan NDJSON events out to the three callbacks. */
+async function runSidecar(
+  messages: Array<{ role: string; content: string }>,
+  agentId: string,
+  callbacks: DispatchCallbacks,
+): Promise<void> {
+  const { onToken, onEnd, onError } = callbacks;
 
   let response: Response;
   try {
     response = await fetch(`${SIDECAR_URL}/api/run`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        agentId: ear.agentId,
-        isTask: true,
-        messages: [{ role: 'user', content: ear.directive }],
-      }),
+      body: JSON.stringify({ agentId, isTask: true, messages }),
     });
   } catch (err) {
     onError(err instanceof Error ? err : new Error(String(err)));
@@ -48,7 +54,6 @@ export async function dispatchLeadAgent(options: DispatchOptions): Promise<void>
     onError(new Error(`sidecar returned ${response.status}`));
     return;
   }
-
   if (!response.body) {
     onError(new Error('sidecar response has no body'));
     return;
@@ -70,31 +75,43 @@ export async function dispatchLeadAgent(options: DispatchOptions): Promise<void>
         const trimmed = line.trim();
         if (!trimmed) continue;  // keepalive blank line
         let event: { name: string; payload?: Record<string, unknown> };
-        try {
-          event = JSON.parse(trimmed) as typeof event;
-        } catch {
-          continue;  // malformed line — skip
-        }
-        const name = event.name;
-        const payload = event.payload ?? {};
+        try { event = JSON.parse(trimmed) as typeof event; } catch { continue; }
 
-        if (name === 'agent.token') {
-          const delta = String(payload.delta ?? '');
+        if (event.name === 'agent.token') {
+          const delta = String(event.payload?.delta ?? '');
           if (delta) onToken(delta);
-        } else if (name === 'agent.run.end') {
+        } else if (event.name === 'agent.run.end') {
           onEnd();
           return;
-        } else if (name === 'agent.run.error') {
-          onError(new Error(String(payload.message ?? 'sidecar run error')));
+        } else if (event.name === 'agent.run.error') {
+          onError(new Error(String(event.payload?.message ?? 'sidecar run error')));
           return;
         }
       }
     }
-    // Stream ended without an explicit agent.run.end — treat as done
-    onEnd();
+    onEnd();  // stream closed without explicit agent.run.end
   } catch (err) {
     onError(err instanceof Error ? err : new Error(String(err)));
   } finally {
     try { reader.cancel(); } catch { /* ignore */ }
   }
+}
+
+/** Approval lane: dispatch the lead agent for a pre-approved EAR. */
+export async function dispatchLeadAgent(options: DispatchOptions): Promise<void> {
+  const { ear, ...callbacks } = options;
+  await runSidecar(
+    [{ role: 'user', content: ear.directive }],
+    ear.agentId,
+    callbacks,
+  );
+}
+
+/** LLM lane: run arbitrary conversation messages through the sidecar. */
+export async function sidecarRunStream(
+  messages: Array<{ role: string; content: string }>,
+  callbacks: DispatchCallbacks,
+  agentId = 'agent',
+): Promise<void> {
+  await runSidecar(messages, agentId, callbacks);
 }
