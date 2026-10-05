@@ -58,24 +58,34 @@ export async function POST(req: NextRequest): Promise<Response> {
     const encoder = new TextEncoder();
     const stream = new ReadableStream({
       async start(controller) {
-        await dispatchLeadAgent({
-          ear,
-          onToken(token: string) {
+        // Wrap dispatchLeadAgent so a thrown or rejected promise is forwarded to the client
+        // as a {"type":"error"} SSE event instead of escaping as an unhandled rejection (GAP-4).
+        const forward = (err: unknown) => {
+          const message = err instanceof Error ? err.message : String(err);
+          try {
             controller.enqueue(
-              encoder.encode(`data: ${JSON.stringify({ type: 'token', token })}\n\n`),
-            );
-          },
-          onEnd() {
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'done' })}\n\n`));
-            controller.close();
-          },
-          onError(err: Error) {
-            controller.enqueue(
-              encoder.encode(`data: ${JSON.stringify({ type: 'error', message: err.message })}\n\n`),
+              encoder.encode(`data: ${JSON.stringify({ type: 'error', message })}\n\n`),
             );
             controller.close();
-          },
-        });
+          } catch { /* controller already closed */ }
+        };
+        try {
+          await dispatchLeadAgent({
+            ear,
+            onToken(token: string) {
+              controller.enqueue(
+                encoder.encode(`data: ${JSON.stringify({ type: 'token', token })}\n\n`),
+              );
+            },
+            onEnd() {
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'done' })}\n\n`));
+              controller.close();
+            },
+            onError(err: Error) { forward(err); },
+          });
+        } catch (err) {
+          forward(err);
+        }
       },
     });
 

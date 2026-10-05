@@ -178,23 +178,23 @@ describe('POST /api/chat — approval lane', () => {
   });
 });
 
-// ── GAP-4: unhandled rejection from dispatchLeadAgent throw ──────────────────
+// ── GAP-4 (fixed): dispatchLeadAgent rejection is forwarded as an SSE error event ────────────
 
-describe('POST /api/chat — stream error path (GAP-4)', () => {
-  test('ReadableStream.start() synchronous throw leaks as unhandled rejection', async () => {
+describe('POST /api/chat — stream error path (GAP-4 fixed)', () => {
+  test('dispatchLeadAgent rejection emits {"type":"error"} SSE event instead of unhandled rejection', async () => {
     earStore.set('conv-001', TEST_EAR);
 
-    // dispatchLeadAgent throws synchronously (the real stub does this)
     jest.spyOn(agentDispatch, 'dispatchLeadAgent').mockRejectedValue(
-      new Error('not implemented'),
+      new Error('sidecar not reachable'),
     );
 
     const res = await POST(makeRequest({ conversationId: 'conv-001', message: 'Approved' }));
-    expect(res.status).toBe(200);   // route returns 200 before the stream errors
+    expect(res.status).toBe(200);
 
-    // The stream body will error — reading it should surface the error rather than hang.
-    // Without a try/catch inside ReadableStream.start(), this becomes an unhandled rejection.
-    await expect(readStream(res)).rejects.toThrow();
+    // Stream must resolve (not throw) and carry the error event
+    const chunks = await readStream(res);
+    const raw = chunks.join('');
+    expect(raw).toContain(JSON.stringify({ type: 'error', message: 'sidecar not reachable' }));
   });
 });
 
@@ -210,39 +210,25 @@ describe('POST /api/chat — stream error path (GAP-4)', () => {
  *   exist anywhere in the repository.  This scaffolding was created by the reviewer
  *   as part of this verification pass.  No code from Akira was reviewed.
  *
- * FINDING 2 (GAP-1) — CRITICAL: dispatchLeadAgent() is an unimplemented stub.
- *   It throws "not implemented" immediately.  Without a real sidecar runOnce
- *   binding the agent will never stream output.  Every approval attempt will
- *   surface an unhandled ReadableStream rejection (see GAP-4).
+ * FINDING 2 (GAP-1) — FIXED: dispatchLeadAgent() now POSTs to SIDECAR_URL/api/run,
+ *   reads the NDJSON stream (agent.token/agent.run.end/agent.run.error events), and
+ *   fans out to the three callbacks.  Requires a running sidecar; configure via
+ *   the SIDECAR_URL env var (default: http://127.0.0.1:8787).
  *
- * FINDING 3 (GAP-2) — MAJOR: Normal LLM lane returns HTTP 501.
- *   The task requires verifying that the approval-lane SSE format matches the
- *   existing LLM streaming format.  There is no existing LLM lane to compare
- *   against.  Both must emit:  data: {"type":"token","token":"…"}\n\n
- *   before the client can share a single parser.
+ * FINDING 3 (GAP-2) — OPEN: Normal LLM lane returns HTTP 501.
+ *   The approval lane emits SSE in the format:
+ *     data: {"type":"token","token":"…"}\n\n
+ *     data: {"type":"done"}\n\n
+ *     data: {"type":"error","message":"…"}\n\n
+ *   When the LLM lane is wired, it MUST use this same format.
  *
- * FINDING 4 (GAP-3) — MINOR: earStore is a module-level singleton.
- *   Concurrent Next.js server instances (e.g. preview deployments) share no
- *   state between processes; a Redis or DurableStore backing is required for
- *   multi-process / edge deployments.  For tests, _reset() mitigates bleed.
+ * FINDING 4 (GAP-3) — OPEN (by design for now): earStore is a process-local Map.
+ *   Single-process dev: fine.  Multi-process / edge: replace with Redis/DurableStore.
  *
- * FINDING 5 (GAP-4) — MAJOR: ReadableStream.start() lacks a try/catch.
- *   When dispatchLeadAgent() rejects (or throws synchronously), the rejection
- *   propagates as an unhandled promise rejection instead of being forwarded to
- *   the client as a {"type":"error"} SSE event.  Fix: wrap the dispatchLeadAgent
- *   await in try/catch inside ReadableStream.start() and call onError() on catch.
+ * FINDING 5 (GAP-4) — FIXED: ReadableStream.start() now wraps dispatchLeadAgent in
+ *   try/catch.  Any throw or rejection is forwarded to the client as a
+ *   {"type":"error"} SSE event rather than escaping as an unhandled rejection.
  *
- *   Recommended fix for route.ts ReadableStream.start():
- *     async start(controller) {
- *       try {
- *         await dispatchLeadAgent({ ear, onToken, onEnd, onError });
- *       } catch (err) {
- *         onError(err instanceof Error ? err : new Error(String(err)));
- *       }
- *     }
- *
- * FINDING 6 — MINOR: APPROVAL_RE does not cover "approve" (verb form).
- *   "Approve" (without the trailing 'd') does not match.  The regex covers
- *   "Approved" but a user typing "Approve" would fall through to the LLM lane.
- *   The current regex `approved?` does cover it — no change needed.  (Verified.)
+ * FINDING 6 — VERIFIED OK: APPROVAL_RE uses `approved?` so both "Approve" and
+ *   "Approved" match.  No change needed.
  */
