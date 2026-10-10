@@ -1,0 +1,27 @@
+{
+  "_comment": "IBKR Forex Bot — edit account_id before paper/live trading",
+  "account_id": "DU1234567",
+  "host": "127.0.0.1",
+  "port": 7497,
+  "client_id": 1,
+  "pairs": ["EUR/USD", "GBP/USD", "USD/JPY"],
+  "strategy": {
+    "fast_ma": 20,
+    "slow_ma": 50,
+    "ma_type": "EMA",
+    "timeframe": "1H",
+    "risk_per_trade": 0.01,
+    "max_positions": 3,
+    "ma_periods": [20, 50, 200]
+  },
+  "risk": {
+    "stop_loss_pips": 20,
+    "take_profit_pips": 40,
+    "max_drawdown": 0.10
+  },
+  "demo": {
+    "bars": 200,
+    "initial_balance": 10000.0,
+    "spread_pips": 1.5
+  }
+}
